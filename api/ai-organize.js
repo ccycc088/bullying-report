@@ -10,6 +10,21 @@ function readJsonBody(req) {
   }
 }
 
+async function readBody(req) {
+  let body = readJsonBody(req);
+  if (body?.text != null && String(body.text).trim().length >= 5) return body;
+
+  if (typeof req.body === 'string' && req.body.length > 0) {
+    try {
+      const p = JSON.parse(req.body);
+      if (p?.text != null) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  return body;
+}
+
 function parseModelJson(raw) {
   const t = (raw || '').replace(/```json\s*/gi, '').replace(/```/g, '').trim();
   try {
@@ -24,6 +39,28 @@ function parseModelJson(raw) {
   throw new Error('MODEL_JSON');
 }
 
+async function generateOnce(apiKey, model, prompt, useJsonMime) {
+  const generationConfig = {
+    temperature: 0.2,
+    maxOutputTokens: 2048
+  };
+  if (useJsonMime) generationConfig.responseMimeType = 'application/json';
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig
+      })
+    }
+  );
+  const data = await response.json();
+  return { response, data };
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -31,18 +68,17 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { text, full } = readJsonBody(req);
+  const { text, full } = await readBody(req);
   if (!text || String(text).trim().length < 5) {
     return res.status(400).json({ error: '描述內容太短' });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) return res.status(500).json({ error: '伺服器未設定 API 金鑰' });
 
   const isFullAnalysis = full !== false;
-  const model =
-    process.env.GEMINI_MODEL ||
-    'gemini-2.0-flash';
+  const preferred =
+    (process.env.GEMINI_MODEL || '').trim() || 'gemini-2.0-flash';
 
   const prompt = isFullAnalysis
     ? `你是一位協助處理校園霸凌通報的專業系統。請根據以下學生的口語描述，進行完整分析。
@@ -70,61 +106,62 @@ ${text}`
 學生描述：
 ${text}`;
 
-  const modelsToTry = [model, 'gemini-2.0-flash', 'gemini-1.5-flash'].filter(
-    (m, i, a) => a.indexOf(m) === i
-  );
+  const models = [
+    preferred,
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-8b'
+  ].filter((m, i, a) => m && a.indexOf(m) === i);
 
   try {
     let lastGemini = null;
-    let response = null;
-    let data = null;
+    let lastOk = null;
 
-    for (const m of modelsToTry) {
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-              temperature: 0.2,
-              maxOutputTokens: 2048,
-              responseMimeType: 'application/json'
-            }
-          })
+    for (const m of models) {
+      for (const useJsonMime of [true, false]) {
+        const { response, data } = await generateOnce(apiKey, m, prompt, useJsonMime);
+        lastGemini = data;
+        if (!response.ok) {
+          if (data?.error?.status === 'NOT_FOUND' || data?.error?.code === 404) {
+            break;
+          }
+          lastOk = { response, data };
+          break;
         }
-      );
-      data = await response.json();
-      lastGemini = data;
-      if (response.ok) break;
-      if (data?.error?.status !== 'NOT_FOUND' && data?.error?.code !== 404) break;
+
+        if (data.promptFeedback?.blockReason) {
+          console.error('Gemini blocked:', data.promptFeedback);
+          return res.status(502).json({ error: '內容無法通過安全檢查，請刪減敏感細節後再試' });
+        }
+
+        const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        if (!raw.trim()) {
+          console.error('Gemini empty parts:', JSON.stringify(data).slice(0, 800));
+          continue;
+        }
+
+        try {
+          const parsed = parseModelJson(raw);
+          return res.status(200).json(parsed);
+        } catch (e) {
+          if (e.message === 'MODEL_JSON' && useJsonMime) continue;
+          if (e.message === 'MODEL_JSON') {
+            return res.status(502).json({ error: 'AI 回覆格式異常，請稍後再試' });
+          }
+          throw e;
+        }
+      }
     }
 
-    if (!response.ok) {
+    if (lastOk && !lastOk.response.ok) {
       console.error('Gemini error:', lastGemini);
       return res.status(502).json({ error: 'AI 服務暫時無法使用，請稍後再試' });
     }
 
-    const reason = data.candidates?.[0]?.finishReason;
-    if (reason && reason !== 'STOP' && reason !== 'MAX_TOKENS') {
-      console.error('Gemini finishReason:', reason, data);
-      return res.status(502).json({ error: 'AI 無法完成分析，請換一段描述再試' });
-    }
-
-    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    if (!raw.trim()) {
-      console.error('Gemini empty text:', JSON.stringify(data).slice(0, 500));
-      return res.status(502).json({ error: 'AI 沒有回傳內容，請稍後再試' });
-    }
-
-    const parsed = parseModelJson(raw);
-    return res.status(200).json(parsed);
+    console.error('Gemini exhausted models:', lastGemini);
+    return res.status(502).json({ error: 'AI 服務暫時無法使用，請稍後再試' });
   } catch (err) {
     console.error('Error:', err);
-    if (err && err.message === 'MODEL_JSON') {
-      return res.status(502).json({ error: 'AI 回覆格式異常，請稍後再試' });
-    }
     return res.status(500).json({ error: '整理失敗，請稍後再試' });
   }
 }
